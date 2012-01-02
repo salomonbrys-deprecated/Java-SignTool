@@ -1,5 +1,3 @@
-// HexDump function taken from http://www.java2s.com/Code/Java/Data-Type/dumpanarrayofbytesinhexform.htm
-
 package com.kya.signtool;
 
 import java.io.BufferedInputStream;
@@ -14,15 +12,19 @@ import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
+import java.util.Date;
 
 import joptsimple.OptionParser;
 import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 
-public class Main {
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.codec.binary.Hex;
+import org.json.JSONObject;
 
-	private static final byte[] HEX_CHAR = new byte[] { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+public class Main {
 
 	public static void main(String[] args) {
 		OptionParser optParser = new OptionParser();
@@ -30,12 +32,15 @@ public class Main {
 		OptionSpec<File> signArg = optParser.acceptsAll(Arrays.asList("s", "sign"), "Action to sign the given file (or stdin)").withOptionalArg().ofType(File.class);
 		OptionSpec<File> verifyArg = optParser.acceptsAll(Arrays.asList("v", "verify"), "Action to verify the given file (or stdin)").withOptionalArg().ofType(File.class);
 		OptionSpec<File> signaturefileArg = optParser.acceptsAll(Arrays.asList("f", "signature-file"), "Read or write in a signature file (stdin or stdout if not specified)").withRequiredArg().ofType(File.class);
-		OptionSpec<String> storetypeArg = optParser.acceptsAll(Arrays.asList("st", "storetype"), "Keystore type").withRequiredArg().ofType(String.class).defaultsTo("JKS");
-		OptionSpec<String> storepassArg = optParser.acceptsAll(Arrays.asList("sp", "storepass"), "Keystore password").withRequiredArg().ofType(String.class);
-		OptionSpec<String> keypassArg = optParser.acceptsAll(Arrays.asList("kp", "keypass"), "With ['s', 'sign']: Privaye key password").withRequiredArg().ofType(String.class);
-		OptionSpec<String> aliasArg = optParser.acceptsAll(Arrays.asList("a", "alias"), "Key alias to use").withRequiredArg().ofType(String.class).defaultsTo("mykey");
-		optParser.accepts("hex", "With ['s', 'sign']: write the signature as hexadecimal dump");
+		OptionSpec<String> storetypeArg = optParser.acceptsAll(Arrays.asList("st", "storetype"), "Keystore type").withRequiredArg().ofType(String.class).defaultsTo("JKS").describedAs("Type");
+		OptionSpec<String> storepassArg = optParser.acceptsAll(Arrays.asList("sp", "storepass"), "Keystore password").withRequiredArg().ofType(String.class).describedAs("Password");
+		OptionSpec<String> keypassArg = optParser.acceptsAll(Arrays.asList("kp", "keypass"), "With ['s', 'sign']: Privaye key password").withRequiredArg().ofType(String.class).describedAs("Password");;
+		OptionSpec<String> aliasArg = optParser.acceptsAll(Arrays.asList("a", "alias"), "Key alias to use").withRequiredArg().ofType(String.class).defaultsTo("mykey").describedAs("Name");
+		OptionSpec<String> formatArg = optParser.accepts("format", "Format of the signature, may be bin, hex, b64, json-hex or json-b64").withRequiredArg().ofType(String.class).defaultsTo("bin").describedAs("Format");
+		optParser.accepts("multi", "With ['format'] not bin: signature file contains multiple signatures");
+		optParser.acceptsAll(Arrays.asList("abs", "absolute-filename"), "With ['multi']: use absolute filename");
 		optParser.acceptsAll(Arrays.asList("h", "help"), "This help");
+		optParser.acceptsAll(Arrays.asList("ndc", "no-date-check"), "Disable date checking");
 		
 		OptionSet optSet;
 		try {
@@ -98,6 +103,28 @@ public class Main {
 				return ;
 			}
 		}
+		
+		X509Certificate cert;
+		try {
+			cert = (X509Certificate)keystore.getCertificate(optSet.valueOf(aliasArg));
+			if (!optSet.has("ndc")) {
+				Date now = new Date();
+				if (cert.getNotBefore().after(now)) {
+					System.out.println("FAILURE: CERTIFICATE NOT YET VALID");
+					System.exit(2);
+					return ;
+				}
+				if (cert.getNotAfter().before(now)) {
+					System.out.println("FAILURE: CERTIFICATE EXPIRED");
+					System.exit(2);
+					return ;
+				}
+			}
+		} catch (Exception e) {
+			System.err.println(e.getMessage());
+			System.exit(42);
+			return ;
+		}
 
 		// SIGNATURE
 		if (optSet.has(signArg)) {
@@ -128,13 +155,13 @@ public class Main {
 			}
 			
 			try {
-				String hexFileName = null;
-				if (optSet.has("hex")) {
-					hexFileName = "";
-					if (optSet.hasArgument(signArg))
-						hexFileName = optSet.valueOf(signArg).getAbsolutePath();
+				String fileName = "";
+				if (fileIS != System.in) {
+					fileName = optSet.valueOf(signArg).getName();
+					if (optSet.hasArgument("abs"))
+						fileName = optSet.valueOf(signArg).getAbsolutePath();
 				}
-				Main.Sign(key, fileIS, signatureOS, hexFileName);
+				Main.Sign(key, cert, fileIS, signatureOS, optSet.valueOf(formatArg), optSet.has("multi"), fileName);
 			}
 			finally {
 				try {
@@ -157,7 +184,6 @@ public class Main {
 			InputStream fileIS;
 			InputStream signatureIS;
 			try {
-				certificate = keystore.getCertificate(optSet.valueOf(aliasArg));
 				if (optSet.hasArgument(verifyArg))
 					fileIS = new FileInputStream(optSet.valueOf(verifyArg));
 				else
@@ -174,7 +200,7 @@ public class Main {
 			}
 			
 			try {
-				Main.Verify(certificate, fileIS, signatureIS);
+				Main.Verify(cert, fileIS, signatureIS);
 			}
 			finally {
 				try {
@@ -192,7 +218,7 @@ public class Main {
 		}
 	}
 
-	public static void Sign(PrivateKey key, InputStream fileIS, OutputStream signatureOS, String hexFileName) {
+	public static void Sign(PrivateKey key, X509Certificate cert, InputStream fileIS, OutputStream signatureOS, String format, boolean multi, String fileName) {
 		try {
 			Signature sign = Signature.getInstance("SHA1with" + key.getAlgorithm());
 			sign.initSign(key);
@@ -204,16 +230,46 @@ public class Main {
 				len = bis.read(buffer);
 				sign.update(buffer, 0, len);
 			}
-			
+
 			byte[] signature = sign.sign();
-			if (hexFileName != null) {
-				if (hexFileName.length() > 0)
-					signatureOS.write((key.getAlgorithm() + "(" + hexFileName + ")= ").getBytes());
-				signatureOS.write(Main.HexDump(signature).getBytes());
-				signatureOS.write('\n');
+			
+			if (format.equals("bin")) {
+				signatureOS.write(signature);
 			}
-			else
-			signatureOS.write(signature);
+			else if (format.equals("hex") || format.equals("b64")) {
+				StringBuilder lineBuilder = new StringBuilder();
+				lineBuilder.append(key.getAlgorithm());
+				lineBuilder.append('(');
+				lineBuilder.append(fileName);
+				lineBuilder.append(':');
+				lineBuilder.append(cert.getSerialNumber());
+				lineBuilder.append(")= ");
+				if (format.equals("hex"))
+					lineBuilder.append(Hex.encodeHexString(signature).toUpperCase());
+				else if (format.equals("b64"))
+					lineBuilder.append(Base64.encodeBase64String(signature));
+				lineBuilder.append('\n');
+				signatureOS.write(lineBuilder.toString().getBytes());
+			}
+			else if (format.equals("json-hex") || format.equals("json-b64")) {
+				JSONObject object = new JSONObject();
+				object.put("fileName", fileName);
+				object.put("serialNumber", cert.getSerialNumber());
+				if (format.equals("json-hex"))
+					object.put("signature", Hex.encodeHexString(signature).toUpperCase());
+				else if (format.equals("json-b64"))
+					object.put("signature", Base64.encodeBase64String(signature));
+				signatureOS.write(object.toString().getBytes());
+			}
+			
+//			if (format.equals("multi-hex") != null) {
+//				if (hexFileName.length() > 0)
+//					signatureOS.write((key.getAlgorithm() + "(" + hexFileName + ")= ").getBytes());
+//				signatureOS.write(Hex.encodeHexString(signature).toUpperCase().getBytes());
+//				signatureOS.write('\n');
+//			}
+//			else
+//			signatureOS.write(signature);
 		}
 		catch (Exception e) {
 			System.err.println(e.getMessage());
@@ -222,22 +278,7 @@ public class Main {
 		}
 	}
 	
-	public static final String HexDump( byte[] buffer ) {
-		if ( buffer == null )
-		{
-			return "";
-		}
-
-		StringBuffer sb = new StringBuffer();
-
-		for ( int i = 0; i < buffer.length; i++ ) {
-			sb.append((char)(HEX_CHAR[(buffer[i] & 0x00F0) >> 4])).append((char)(HEX_CHAR[buffer[i] & 0x000F]));
-		}
-
-		return sb.toString();
-	}
-	
-	public static void Verify(Certificate certificate, InputStream fileIS, InputStream signatureIS) {
+	public static void Verify(X509Certificate certificate, InputStream fileIS, InputStream signatureIS) {
 		try {
 			Signature sign = Signature.getInstance("SHA1with" + certificate.getPublicKey().getAlgorithm());
 			sign.initVerify(certificate);
@@ -264,7 +305,7 @@ public class Main {
 				return ;
 			}
 
-			System.out.println("FAILURE");
+			System.out.println("FAILURE: NO MATCH");
 			System.exit(1);
 		}
 		catch (Exception e) {
